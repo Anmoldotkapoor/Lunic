@@ -1,0 +1,90 @@
+name: Deploy Lunic to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v6
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Build the GitHub Pages site
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from html.parser import HTMLParser
+          from urllib.parse import urlsplit
+          import re, shutil, subprocess, zipfile
+          destination = Path('_site')
+          if Path('scripts/build_pages.py').is_file() and Path('index.html').is_file():
+              subprocess.run(['python3', 'scripts/build_pages.py'], check=True)
+          else:
+              archive_path = Path('Lunic-Netlify.zip')
+              if not archive_path.is_file():
+                  archive_path = Path('output/Lunic-Netlify.zip')
+              if destination.exists():
+                  shutil.rmtree(destination)
+              destination.mkdir()
+              with zipfile.ZipFile(archive_path) as archive:
+                  assert archive.testzip() is None, 'The site ZIP is damaged'
+                  for member in archive.infolist():
+                      path = PurePosixPath(member.filename)
+                      assert not path.is_absolute() and '..' not in path.parts, 'Unsafe ZIP path'
+                      if member.is_dir() or path.name in {'_headers', 'netlify.toml'}:
+                          continue
+                      allowed = (len(path.parts) == 1 and path.suffix in {'.html', '.css', '.js'}) or (path.parts[0] == 'assets' and path.suffix in {'.webp', '.svg', '.png', '.jpg', '.jpeg', '.woff', '.woff2'})
+                      if allowed:
+                          archive.extract(member, destination)
+              for file in destination.glob('*.html'):
+                  text = file.read_text().replace('href="/', 'href="./').replace('src="/', 'src="./')
+                  file.write_text(text)
+              for file in destination.glob('*.css'):
+                  file.write_text(file.read_text().replace("url('/assets/", "url('./assets/").replace('url("/assets/', 'url("./assets/'))
+              for file in destination.glob('*.js'):
+                  file.write_text(file.read_text().replace('src="/assets/', 'src="./assets/'))
+              (destination / '.nojekyll').touch()
+          class CheckReferences(HTMLParser):
+              def handle_starttag(self, tag, attributes):
+                  for name, value in attributes:
+                      if name not in {'src', 'href'} or not value or value.startswith('#') or urlsplit(value).scheme:
+                          continue
+                      assert value.startswith('./'), f'Asset must be project-relative: {value}'
+                      assert (destination / urlsplit(value).path).is_file(), f'Missing asset: {value}'
+          CheckReferences().feed((destination / 'index.html').read_text())
+          for file in destination.glob('*.css'):
+              for value in re.findall(r"url\(\s*['\"]?([^\s)'\"]+)", file.read_text()):
+                  if not value.startswith(('data:', 'https:', '#')):
+                      assert not value.startswith('/') and (file.parent / value).is_file(), f'Missing CSS asset: {value}'
+          print(f'GitHub Pages build verified: {sum(p.is_file() for p in destination.rglob("*"))} public files')
+          PY
+          for file in _site/*.js; do node --check "$file"; done
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload the website
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+          include-hidden-files: true
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
